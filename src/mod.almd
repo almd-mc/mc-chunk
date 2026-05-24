@@ -1,258 +1,202 @@
-import bytes
-
-// Minecraft Chunk parser (1.18+ format).
+// Minecraft chunk data for 1.21.1.
+// Reference: https://minecraft.wiki/w/Java_Edition_protocol/Chunk_format
+//
+// A chunk is 16x384x16 blocks (24 sections of 16x16x16).
+// Each section uses a paletted container for block states.
 //
 // Usage:
-//   import mc_chunk as chunk
-//   let col = chunk.parse_column(data, 24)!
-//   let state_id = chunk.get_block(col, 0, 64, 0)
+//   import mc_chunk
+//   let section = mc_chunk.new_section()
+//   let s2 = mc_chunk.set_block(section, 0, 0, 0, 1)
+//   let block_id = mc_chunk.get_block(s2, 0, 0, 0)
 
-// ── Constants ───────────────────────────────────
+// --- Constants ---
 
-let SECTION_SIZE = 16
-let SECTION_VOLUME = 4096  // 16 * 16 * 16
-let BIOME_VOLUME = 64      // 4 * 4 * 4
+let SECTION_WIDTH = 16
+let SECTION_HEIGHT = 16
+let SECTION_VOLUME = 4096
+let CHUNK_SECTIONS = 24
+let CHUNK_MIN_Y = -64
+let CHUNK_MAX_Y = 319
+let CHUNK_HEIGHT = 384
 
-// ── Types ───────────────────────────────────────
+// --- Section (16x16x16 block states) ---
 
 type ChunkSection = {
+  palette: List[Int],
+  blocks: List[Int],
   block_count: Int,
-  block_states: List[Int],  // SECTION_VOLUME state IDs
-  biomes: List[Int],        // BIOME_VOLUME biome IDs
 }
 
-type ChunkColumn = {
+fn new_section() -> ChunkSection = {
+  { palette: [0], blocks: list.repeat(0, SECTION_VOLUME), block_count: 0 }
+}
+
+// Get block state at local coordinates (0-15 each)
+fn get_block(section: ChunkSection, x: Int, y: Int, z: Int) -> Int = {
+  let index = y * 256 + z * 16 + x
+  let palette_index = list.get(section.blocks, index) ?? 0
+  list.get(section.palette, palette_index) ?? 0
+}
+
+// Set block state at local coordinates
+fn set_block(section: ChunkSection, x: Int, y: Int, z: Int, block_id: Int) -> ChunkSection = {
+  let index = y * 256 + z * 16 + x
+  // Find or add to palette
+  let palette_index = find_or_add_palette(section.palette, block_id)
+  let old_palette_idx = list.get(section.blocks, palette_index.index) ?? 0
+  let old_id = list.get(section.palette, old_palette_idx) ?? 0
+  let new_blocks = list.set(section.blocks, index, palette_index.index)
+  // Update block count
+  let delta = if block_id != 0 and old_id == 0 then 1
+    else if block_id == 0 and old_id != 0 then -1
+    else 0
+  { palette: palette_index.palette, blocks: new_blocks, block_count: section.block_count + delta }
+}
+
+local fn find_or_add_palette(palette: List[Int], block_id: Int) -> { palette: List[Int], index: Int } = {
+  var found = -1
+  for i in 0..list.length(palette) {
+    if (list.get(palette, i) ?? -1) == block_id then { found = i } else { () }
+  }
+  if found >= 0 then { palette: palette, index: found }
+  else { palette: palette + [block_id], index: list.length(palette) }
+}
+
+// --- Chunk (24 sections) ---
+
+type Chunk = {
   x: Int,
   z: Int,
   sections: List[ChunkSection],
-  min_y: Int,
 }
 
-// ── Parse chunk column from network data ────────
+fn new_chunk(chunk_x: Int, chunk_z: Int) -> Chunk = {
+  { x: chunk_x, z: chunk_z, sections: list.repeat(new_section(), CHUNK_SECTIONS) }
+}
 
-effect fn parse_column(data: Bytes, num_sections: Int) -> ChunkColumn =
-  parse_column_at(data, 0, num_sections)!
+// Convert world Y to section index (0-23)
+fn section_index(world_y: Int) -> Int =
+  (world_y - CHUNK_MIN_Y) / 16
 
-effect fn parse_column_at(data: Bytes, start: Int, num_sections: Int) -> ChunkColumn = {
-  var pos = start
-  var sections: List[ChunkSection] = []
-  var i = 0
-  while i < num_sections {
-    let section = parse_section(data, pos)!
-    sections = sections + [section.section]
-    pos = section.pos
-    i = i + 1
+// Get block at world coordinates within chunk
+fn get_world_block(chunk: Chunk, x: Int, y: Int, z: Int) -> Int = {
+  let sec_idx = section_index(y)
+  let section = list.get(chunk.sections, sec_idx) ?? new_section()
+  get_block(section, x % 16, y % 16, z % 16)
+}
+
+// Set block at world coordinates within chunk
+fn set_world_block(chunk: Chunk, x: Int, y: Int, z: Int, block_id: Int) -> Chunk = {
+  let sec_idx = section_index(y)
+  let section = list.get(chunk.sections, sec_idx) ?? new_section()
+  let updated = set_block(section, x % 16, y % 16, z % 16, block_id)
+  { ...chunk, sections: list.set(chunk.sections, sec_idx, updated) }
+}
+
+// --- Chunk column tracker ---
+
+type ChunkTracker = {
+  chunks: List[Chunk],
+}
+
+fn new_tracker() -> ChunkTracker = { chunks: [] }
+
+fn get_chunk(tracker: ChunkTracker, cx: Int, cz: Int) -> Option[Chunk] = {
+  var found: Option[Chunk] = none
+  for c in tracker.chunks {
+    if c.x == cx and c.z == cz then { found = some(c) } else { () }
   }
-  { x: 0, z: 0, sections: sections, min_y: -64 }
+  found
 }
 
-type SectionResult = { section: ChunkSection, pos: Int }
-
-effect fn parse_section(data: Bytes, pos: Int) -> SectionResult = {
-  let block_count = bytes.read_i16_be(data, pos)
-  let blocks = parse_palette_container(data, pos + 2, SECTION_VOLUME, 4, 8, 15)!
-  let biome = parse_palette_container(data, blocks.pos, BIOME_VOLUME, 1, 3, 6)!
-  {
-    section: { block_count: block_count, block_states: blocks.entries, biomes: biome.entries },
-    pos: biome.pos,
-  }
+fn set_chunk(tracker: ChunkTracker, chunk: Chunk) -> ChunkTracker = {
+  let filtered = list.filter(tracker.chunks, (c) => not (c.x == chunk.x and c.z == chunk.z))
+  { chunks: filtered + [chunk] }
 }
 
-// ── Palette container parsing ───────────────────
-
-type PaletteResult = { entries: List[Int], pos: Int }
-
-effect fn parse_palette_container(data: Bytes, pos: Int, volume: Int, min_bits: Int, max_bits: Int, global_bits: Int) -> PaletteResult = {
-  let bits_per_entry = bytes.read_u8(data, pos)
-  if bits_per_entry == 0 then parse_single_valued(data, pos + 1, volume)!
-  else if bits_per_entry <= max_bits then parse_indirect(data, pos + 1, volume, bits_per_entry)!
-  else parse_direct(data, pos + 1, volume, global_bits)!
+fn unload_chunk(tracker: ChunkTracker, cx: Int, cz: Int) -> ChunkTracker = {
+  { chunks: list.filter(tracker.chunks, (c) => not (c.x == cx and c.z == cz)) }
 }
 
-// Single-valued: entire section is one block/biome
-effect fn parse_single_valued(data: Bytes, pos: Int, volume: Int) -> PaletteResult = {
-  let varint = read_varint(data, pos)
-  let value = varint.value
-  let data_len = read_varint(data, varint.pos)
-  // data_len.value should be 0 (no data array)
-  let entries = list.repeat(value, volume)
-  { entries: entries, pos: data_len.pos }
-}
+fn loaded_count(tracker: ChunkTracker) -> Int =
+  list.length(tracker.chunks)
 
-// Indirect palette: palette + packed data
-effect fn parse_indirect(data: Bytes, pos: Int, volume: Int, bits: Int) -> PaletteResult = {
-  let pal_len_r = read_varint(data, pos)
-  var palette: List[Int] = []
-  var p = pal_len_r.pos
-  var pi = 0
-  while pi < pal_len_r.value {
-    let v = read_varint(data, p)
-    palette = palette + [v.value]
-    p = v.pos
-    pi = pi + 1
-  }
-  let data_len_r = read_varint(data, p)
-  let entries = unpack_longs(data, data_len_r.pos, volume, bits, palette)
-  let skip = data_len_r.value * 8
-  { entries: entries, pos: data_len_r.pos + skip }
-}
+// --- Tests ---
 
-// Direct palette: no palette, state IDs stored directly
-effect fn parse_direct(data: Bytes, pos: Int, volume: Int, bits: Int) -> PaletteResult = {
-  let data_len_r = read_varint(data, pos)
-  let entries = unpack_longs_direct(data, data_len_r.pos, volume, bits)
-  let skip = data_len_r.value * 8
-  { entries: entries, pos: data_len_r.pos + skip }
-}
-
-// ── Bit unpacking ───────────────────────────────
-
-fn unpack_longs(data: Bytes, pos: Int, count: Int, bits: Int, palette: List[Int]) -> List[Int] = {
-  let mask = int.bshl(1, bits) - 1
-  let per_long = 64 / bits
-  var entries: List[Int] = []
-  var idx = 0
-  var long_idx = 0
-  while idx < count {
-    let long_val = read_i64_be(data, pos + long_idx * 8)
-    var j = 0
-    while j < per_long and idx < count {
-      let pal_idx = int.band(int.bshr(long_val, j * bits), mask)
-      let state_id = list.get(palette, pal_idx) ?? 0
-      entries = entries + [state_id]
-      j = j + 1
-      idx = idx + 1
-    }
-    long_idx = long_idx + 1
-  }
-  entries
-}
-
-fn unpack_longs_direct(data: Bytes, pos: Int, count: Int, bits: Int) -> List[Int] = {
-  let mask = int.bshl(1, bits) - 1
-  let per_long = 64 / bits
-  var entries: List[Int] = []
-  var idx = 0
-  var long_idx = 0
-  while idx < count {
-    let long_val = read_i64_be(data, pos + long_idx * 8)
-    var j = 0
-    while j < per_long and idx < count {
-      let state_id = int.band(int.bshr(long_val, j * bits), mask)
-      entries = entries + [state_id]
-      j = j + 1
-      idx = idx + 1
-    }
-    long_idx = long_idx + 1
-  }
-  entries
-}
-
-// ── Block access ────────────────────────────────
-
-fn get_block(col: ChunkColumn, x: Int, y: Int, z: Int) -> Int = {
-  let section_y = (y - col.min_y) / SECTION_SIZE
-  let local_y = (y - col.min_y) % SECTION_SIZE
-  match list.get(col.sections, section_y) {
-    some(section) => {
-      let idx = local_y * 256 + z * 16 + x
-      list.get(section.block_states, idx) ?? 0
-    },
-    none => 0,
-  }
-}
-
-fn set_block(col: ChunkColumn, x: Int, y: Int, z: Int, state_id: Int) -> ChunkColumn = {
-  let section_y = (y - col.min_y) / SECTION_SIZE
-  let local_y = (y - col.min_y) % SECTION_SIZE
-  let idx = local_y * 256 + z * 16 + x
-  match list.get(col.sections, section_y) {
-    some(section) => {
-      let new_states = list.set(section.block_states, idx, state_id)
-      let new_section = { ...section, block_states: new_states }
-      { ...col, sections: list.set(col.sections, section_y, new_section) }
-    },
-    none => col,
-  }
-}
-
-fn section_at(col: ChunkColumn, section_y: Int) -> Option[ChunkSection] =
-  list.get(col.sections, section_y)
-
-// ── Helpers ─────────────────────────────────────
-
-type VarIntResult = { value: Int, pos: Int }
-
-fn read_varint(data: Bytes, pos: Int) -> VarIntResult = read_varint_rec(data, pos, 0, 0)
-
-fn read_varint_rec(data: Bytes, pos: Int, value: Int, shift: Int) -> VarIntResult = {
-  let b = bytes.read_u8(data, pos)
-  let new_val = int.bor(value, int.bshl(int.band(b, 0x7F), shift))
-  if int.band(b, 0x80) == 0 then { value: new_val, pos: pos + 1 }
-  else read_varint_rec(data, pos + 1, new_val, shift + 7)
-}
-
-fn read_i64_be(data: Bytes, pos: Int) -> Int =
-  bytes.read_i64_be(data, pos)
-
-// ── Empty chunk for testing ─────────────────────
-
-fn empty_section() -> ChunkSection =
-  { block_count: 0, block_states: list.repeat(0, SECTION_VOLUME), biomes: list.repeat(0, BIOME_VOLUME) }
-
-fn empty_column(num_sections: Int) -> ChunkColumn =
-  { x: 0, z: 0, sections: list.repeat(empty_section(), num_sections), min_y: -64 }
-
-// ── Tests ───────────────────────────────────────
-
-test "empty column" {
-  let col = empty_column(24)
-  assert_eq(list.len(col.sections), 24)
-  assert_eq(get_block(col, 0, 0, 0), 0)
+test "new section is all air" {
+  let s = new_section()
+  assert_eq(get_block(s, 0, 0, 0), 0)
+  assert_eq(get_block(s, 15, 15, 15), 0)
+  assert_eq(s.block_count, 0)
 }
 
 test "set and get block" {
-  var col = empty_column(24)
-  col = set_block(col, 5, 64, 10, 42)
-  assert_eq(get_block(col, 5, 64, 10), 42)
-  assert_eq(get_block(col, 0, 64, 0), 0)
+  let s = set_block(new_section(), 5, 10, 3, 1)
+  assert_eq(get_block(s, 5, 10, 3), 1)
+  assert_eq(get_block(s, 0, 0, 0), 0)
 }
 
-test "section indexing" {
-  let col = empty_column(24)
-  // y=0 with min_y=-64 → section 4 (0-(-64))/16 = 4
-  assert_eq(get_block(col, 0, 0, 0), 0)
-  // y=-64 → section 0
-  assert_eq(get_block(col, 0, -64, 0), 0)
+test "palette grows" {
+  var s = new_section()
+  s = set_block(s, 0, 0, 0, 1)
+  s = set_block(s, 1, 0, 0, 2)
+  s = set_block(s, 2, 0, 0, 3)
+  assert_eq(list.length(s.palette), 4)
+  assert_eq(get_block(s, 0, 0, 0), 1)
+  assert_eq(get_block(s, 1, 0, 0), 2)
+  assert_eq(get_block(s, 2, 0, 0), 3)
 }
 
-test "varint decode" {
-  let data = bytes.from_list([0x01])
-  let r = read_varint(data, 0)
-  assert_eq(r.value, 1)
-  assert_eq(r.pos, 1)
+test "section_index" where [
+  "y=-64 (bottom)"  [y = -64, want = 0],
+  "y=0 (sea level area)" [y = 0, want = 4],
+  "y=64"  [y = 64, want = 8],
+  "y=319 (top)" [y = 319, want = 23],
+] {
+  assert_eq(section_index(y), want)
 }
 
-test "varint multi-byte" {
-  let data = bytes.from_list([0x80, 0x01])
-  let r = read_varint(data, 0)
-  assert_eq(r.value, 128)
-  assert_eq(r.pos, 2)
+test "chunk constants" {
+  assert_eq(CHUNK_MIN_Y, -64)
+  assert_eq(CHUNK_MAX_Y, 319)
+  assert_eq(CHUNK_HEIGHT, 384)
+  assert_eq(CHUNK_SECTIONS, 24)
 }
 
-test "single valued section parse" {
-  // bits_per_entry=0, palette=[42], data_len=0
-  let data = bytes.from_list([
-    0x00, 0x00,  // block_count = 0
-    0x00,        // bits_per_entry = 0 (single valued)
-    0x2A,        // palette value = 42 (varint)
-    0x00,        // data array length = 0 (varint)
-    0x00,        // biome bits_per_entry = 0
-    0x00,        // biome palette value = 0
-    0x00,        // biome data length = 0
-  ])
-  let r = parse_section(data, 0)!
-  assert_eq(list.len(r.section.block_states), SECTION_VOLUME)
-  assert_eq(list.get(r.section.block_states, 0) ?? -1, 42)
-  assert_eq(list.get(r.section.block_states, 4095) ?? -1, 42)
+test "new chunk" {
+  let c = new_chunk(0, 0)
+  assert_eq(c.x, 0)
+  assert_eq(c.z, 0)
+  assert_eq(list.length(c.sections), CHUNK_SECTIONS)
+}
+
+test "chunk tracker" {
+  var t = new_tracker()
+  assert_eq(loaded_count(t), 0)
+  t = set_chunk(t, new_chunk(0, 0))
+  t = set_chunk(t, new_chunk(1, 0))
+  assert_eq(loaded_count(t), 2)
+  assert_ne(get_chunk(t, 0, 0), none)
+  assert_eq(get_chunk(t, 5, 5), none)
+  t = unload_chunk(t, 0, 0)
+  assert_eq(loaded_count(t), 1)
+}
+
+test "set_world_block and get_world_block" {
+  let c = set_world_block(new_chunk(0, 0), 5, 64, 3, 42)
+  assert_eq(get_world_block(c, 5, 64, 3), 42)
+  assert_eq(get_world_block(c, 0, 0, 0), 0)
+}
+
+test "find_or_add_palette reuses existing" {
+  let r1 = find_or_add_palette([0, 1, 2], 1)
+  assert_eq(r1.index, 1)
+  assert_eq(list.length(r1.palette), 3)
+}
+
+test "find_or_add_palette adds new" {
+  let r = find_or_add_palette([0, 1], 5)
+  assert_eq(r.index, 2)
+  assert_eq(list.length(r.palette), 3)
 }
