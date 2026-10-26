@@ -56,7 +56,7 @@ fn set_block(section: ChunkSection, x: Int, y: Int, z: Int, block_id: Int) -> Ch
 
 local fn find_or_add_palette(palette: List[Int], block_id: Int) -> { palette: List[Int], index: Int } = {
   var found = -1
-  for i in 0..list.length(palette) {
+  for i in 0..<list.length(palette) {
     if (list.get(palette, i) ?? -1) == block_id then { found = i } else { () }
   }
   if found >= 0 then { palette: palette, index: found }
